@@ -27,6 +27,11 @@ This repository is a backup of that leaked source, and this README is a full bre
 
 Let's get into it.
 
+## Local LLMs
+
+This Rust port can also be pointed at a local Anthropic-compatible backend such as
+`llama.cpp` server. See [LOCAL_LLM.md](./LOCAL_LLM.md).
+
 ## How Did This Even Happen?
 
 This is the part that honestly made me go "...really?"
