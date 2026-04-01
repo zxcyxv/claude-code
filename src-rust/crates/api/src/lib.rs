@@ -202,14 +202,9 @@ pub mod streaming {
             content_block: ContentBlock,
         },
         /// Incremental delta for an existing content block.
-        ContentBlockDelta {
-            index: usize,
-            delta: ContentDelta,
-        },
+        ContentBlockDelta { index: usize, delta: ContentDelta },
         /// A content block is finished.
-        ContentBlockStop {
-            index: usize,
-        },
+        ContentBlockStop { index: usize },
         /// Final message-level delta (stop_reason, usage).
         MessageDelta {
             stop_reason: Option<String>,
@@ -218,10 +213,7 @@ pub mod streaming {
         /// The message is complete.
         MessageStop,
         /// An error occurred during streaming.
-        Error {
-            error_type: String,
-            message: String,
-        },
+        Error { error_type: String, message: String },
         /// A ping/keep-alive event.
         Ping,
     }
@@ -440,11 +432,9 @@ pub mod client {
         // ---- Internal helpers --------------------------------------------
 
         /// Build the common request and execute with retry logic.
-        async fn send_with_retry(
-            &self,
-            body: &Value,
-        ) -> Result<reqwest::Response, ClaudeError> {
+        async fn send_with_retry(&self, body: &Value) -> Result<reqwest::Response, ClaudeError> {
             let url = format!("{}/v1/messages", self.config.api_base);
+            let local_backend = cc_core::config::Config::api_base_is_local(&self.config.api_base);
             let mut attempts = 0u32;
             let mut delay = self.config.initial_retry_delay;
 
@@ -456,9 +446,11 @@ pub mod client {
                     .http
                     .post(&url)
                     .header("anthropic-version", &self.config.api_version)
-                    .header("anthropic-beta", &self.config.beta_features)
                     .header("content-type", "application/json")
                     .header("accept", "text/event-stream");
+                if !local_backend && !self.config.beta_features.is_empty() {
+                    req = req.header("anthropic-beta", &self.config.beta_features);
+                }
                 req = if self.config.use_bearer_auth {
                     req.header("Authorization", format!("Bearer {}", &self.config.api_key))
                 } else {
@@ -560,9 +552,7 @@ pub mod client {
                 for line in lines {
                     let line = line.trim_end_matches('\r');
                     if let Some(frame) = parser.feed_line(line) {
-                        if let Some(event) =
-                            Self::frame_to_event(&frame.event, &frame.data)
-                        {
+                        if let Some(event) = Self::frame_to_event(&frame.event, &frame.data) {
                             handler.on_event(&event);
                             if tx.send(event).await.is_err() {
                                 // Receiver dropped – stop reading.
@@ -577,10 +567,7 @@ pub mod client {
         }
 
         /// Convert a parsed SSE frame into a typed `StreamEvent`.
-        fn frame_to_event(
-            event_type: &Option<String>,
-            data: &str,
-        ) -> Option<StreamEvent> {
+        fn frame_to_event(event_type: &Option<String>, data: &str) -> Option<StreamEvent> {
             let event_name = event_type.as_deref().unwrap_or("");
 
             match event_name {
@@ -833,7 +820,10 @@ impl StreamAccumulator {
                         name: name.clone(),
                         json_buf: String::new(),
                     },
-                    ContentBlock::Thinking { thinking, signature } => PartialBlock::Thinking {
+                    ContentBlock::Thinking {
+                        thinking,
+                        signature,
+                    } => PartialBlock::Thinking {
                         thinking_buf: thinking.clone(),
                         signature_buf: signature.clone(),
                     },

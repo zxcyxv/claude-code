@@ -11,6 +11,8 @@
 mod oauth_flow;
 
 use anyhow::Context;
+use async_trait::async_trait;
+use cc_core::types::ToolDefinition;
 use cc_core::{
     config::{Config, PermissionMode, Settings},
     constants::{APP_VERSION, DEFAULT_MODEL},
@@ -18,8 +20,6 @@ use cc_core::{
     cost::CostTracker,
     permissions::{AutoPermissionHandler, InteractivePermissionHandler},
 };
-use async_trait::async_trait;
-use cc_core::types::ToolDefinition;
 use cc_tools::{PermissionLevel, Tool, ToolContext, ToolResult};
 use clap::{ArgAction, Parser, ValueEnum};
 use std::{path::PathBuf, sync::Arc};
@@ -264,8 +264,7 @@ async fn main() -> anyhow::Result<()> {
     let log_level = if cli.verbose { "debug" } else { "warn" };
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(log_level)),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level)),
         )
         .with_target(false)
         .without_time()
@@ -312,8 +311,7 @@ async fn main() -> anyhow::Result<()> {
 
     // --dump-system-prompt fast path
     if cli.dump_system_prompt {
-        let ctx = ContextBuilder::new(cwd.clone())
-            .disable_claude_mds(config.disable_claude_mds);
+        let ctx = ContextBuilder::new(cwd.clone()).disable_claude_mds(config.disable_claude_mds);
         let sys = ctx.build_system_context().await;
         let user = ctx.build_user_context().await;
         println!("{}\n\n{}", sys, user);
@@ -321,8 +319,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Build context
-    let ctx_builder = ContextBuilder::new(cwd.clone())
-        .disable_claude_mds(config.disable_claude_mds);
+    let ctx_builder =
+        ContextBuilder::new(cwd.clone()).disable_claude_mds(config.disable_claude_mds);
     let system_ctx = ctx_builder.build_system_context().await;
     let user_ctx = ctx_builder.build_user_context().await;
 
@@ -343,6 +341,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Determine mode early (needed for auth error handling and permission handler selection).
     let is_headless = cli.print || cli.prompt.is_some();
+    let use_local_backend = config.use_local_backend();
 
     // Initialize API client.
     // Try config/env first; fall back to saved OAuth tokens; finally prompt for login.
@@ -350,17 +349,21 @@ async fn main() -> anyhow::Result<()> {
         Some(auth) => auth,
         None => {
             // No credential found — run interactive OAuth login (non-headless) or error.
-            if is_headless {
-                anyhow::bail!(
-                    "No API key found. Set ANTHROPIC_API_KEY, use --api-key, or run `claude login`."
-                );
+            if use_local_backend {
+                ("local".to_string(), false)
+            } else {
+                if is_headless {
+                    anyhow::bail!(
+                        "No API key found. Set ANTHROPIC_API_KEY, use --api-key, or run `claude login`."
+                    );
+                }
+                eprintln!("No authentication found. Starting login flow...");
+                let result = oauth_flow::run_oauth_login_flow(true)
+                    .await
+                    .context("Login failed")?;
+                println!("Login successful!");
+                (result.credential, result.use_bearer_auth)
             }
-            eprintln!("No authentication found. Starting login flow...");
-            let result = oauth_flow::run_oauth_login_flow(true)
-                .await
-                .context("Login failed")?;
-            println!("Login successful!");
-            (result.credential, result.use_bearer_auth)
         }
     };
 
@@ -371,8 +374,7 @@ async fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
     let client = Arc::new(
-        cc_api::AnthropicClient::new(client_config)
-            .context("Failed to create API client")?,
+        cc_api::AnthropicClient::new(client_config).context("Failed to create API client")?,
     );
 
     // Build tools
@@ -393,7 +395,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize MCP servers first (needed for ToolContext.mcp_manager).
     let mcp_manager_arc: Option<Arc<cc_mcp::McpManager>> = if !config.mcp_servers.is_empty() {
-        info!(count = config.mcp_servers.len(), "Connecting to MCP servers");
+        info!(
+            count = config.mcp_servers.len(),
+            "Connecting to MCP servers"
+        );
         let mcp_manager = cc_mcp::McpManager::connect_all(&config.mcp_servers).await;
         if mcp_manager.server_count() > 0 {
             Some(Arc::new(mcp_manager))
@@ -464,15 +469,7 @@ async fn main() -> anyhow::Result<()> {
 
     // --print mode (headless)
     let result = if is_headless {
-        run_headless(
-            &cli,
-            client,
-            tools,
-            tool_ctx,
-            query_config,
-            cost_tracker,
-        )
-        .await
+        run_headless(&cli, client, tools, tool_ctx, query_config, cost_tracker).await
     } else {
         run_interactive(
             config,
@@ -523,7 +520,10 @@ async fn run_headless(
         std::process::exit(1);
     }
 
-    let is_json_output = matches!(cli.output_format, CliOutputFormat::Json | CliOutputFormat::StreamJson);
+    let is_json_output = matches!(
+        cli.output_format,
+        CliOutputFormat::Json | CliOutputFormat::StreamJson
+    );
     let is_stream_json = matches!(cli.output_format, CliOutputFormat::StreamJson);
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<QueryEvent>();
@@ -595,41 +595,42 @@ async fn run_headless(
     }
 
     // Wait for the query task to finish and get the final outcome
-    let outcome = query_handle.await.unwrap_or(QueryOutcome::Error(
-        cc_core::error::ClaudeError::Other("Query task panicked".to_string()),
-    ));
+    let outcome =
+        query_handle
+            .await
+            .unwrap_or(QueryOutcome::Error(cc_core::error::ClaudeError::Other(
+                "Query task panicked".to_string(),
+            )));
 
     // Final output
     match cli.output_format {
-        CliOutputFormat::Json => {
-            match outcome {
-                QueryOutcome::EndTurn { message, usage } => {
-                    let result_text = if full_text.is_empty() {
-                        message.get_all_text()
-                    } else {
-                        full_text
-                    };
-                    let out = serde_json::json!({
-                        "type": "result",
-                        "result": result_text,
-                        "usage": {
-                            "input_tokens": usage.input_tokens,
-                            "output_tokens": usage.output_tokens,
-                            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
-                            "cache_read_input_tokens": usage.cache_read_input_tokens,
-                        },
-                        "cost_usd": cost_tracker.total_cost_usd(),
-                    });
-                    println!("{}", out);
-                }
-                QueryOutcome::Error(e) => {
-                    let out = serde_json::json!({ "type": "error", "error": e.to_string() });
-                    eprintln!("{}", out);
-                    std::process::exit(1);
-                }
-                _ => {}
+        CliOutputFormat::Json => match outcome {
+            QueryOutcome::EndTurn { message, usage } => {
+                let result_text = if full_text.is_empty() {
+                    message.get_all_text()
+                } else {
+                    full_text
+                };
+                let out = serde_json::json!({
+                    "type": "result",
+                    "result": result_text,
+                    "usage": {
+                        "input_tokens": usage.input_tokens,
+                        "output_tokens": usage.output_tokens,
+                        "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                        "cache_read_input_tokens": usage.cache_read_input_tokens,
+                    },
+                    "cost_usd": cost_tracker.total_cost_usd(),
+                });
+                println!("{}", out);
             }
-        }
+            QueryOutcome::Error(e) => {
+                let out = serde_json::json!({ "type": "error", "error": e.to_string() });
+                eprintln!("{}", out);
+                std::process::exit(1);
+            }
+            _ => {}
+        },
         CliOutputFormat::StreamJson => {
             // Already streamed above; emit final result event
             match outcome {
@@ -743,7 +744,9 @@ async fn run_interactive(
                 Event::Key(key) => {
                     // Ctrl+C while streaming => cancel
                     if key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                        && key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL)
                     {
                         if app.is_streaming {
                             if let Some(ref ct) = cancel {
@@ -759,7 +762,9 @@ async fn run_interactive(
 
                     // Ctrl+D on empty input => quit
                     if key.code == KeyCode::Char('d')
-                        && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                        && key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL)
                         && app.input.is_empty()
                     {
                         break 'main;
@@ -780,8 +785,7 @@ async fn run_interactive(
                                 Some(CommandResult::ClearConversation) => {
                                     messages.clear();
                                     app.messages.clear();
-                                    app.status_message =
-                                        Some("Conversation cleared.".to_string());
+                                    app.status_message = Some("Conversation cleared.".to_string());
                                 }
                                 Some(CommandResult::SetMessages(new_msgs)) => {
                                     let removed = messages.len().saturating_sub(new_msgs.len());
@@ -794,14 +798,12 @@ async fn run_interactive(
                                     ));
                                 }
                                 Some(CommandResult::Message(msg)) => {
-                                    app.messages
-                                        .push(cc_core::types::Message::assistant(msg));
+                                    app.messages.push(cc_core::types::Message::assistant(msg));
                                 }
                                 Some(CommandResult::ConfigChange(new_cfg)) => {
                                     cmd_ctx.config = new_cfg.clone();
                                     app.config = new_cfg;
-                                    app.status_message =
-                                        Some("Configuration updated.".to_string());
+                                    app.status_message = Some("Configuration updated.".to_string());
                                 }
                                 Some(CommandResult::ConfigChangeMessage(new_cfg, msg)) => {
                                     cmd_ctx.config = new_cfg.clone();
@@ -811,8 +813,7 @@ async fn run_interactive(
                                 Some(CommandResult::UserMessage(msg)) => {
                                     // Inject as user turn
                                     messages.push(cc_core::types::Message::user(msg.clone()));
-                                    app.messages
-                                        .push(cc_core::types::Message::user(msg));
+                                    app.messages.push(cc_core::types::Message::user(msg));
                                     // Fall through to send to model
                                 }
                                 Some(CommandResult::StartOAuthFlow(with_claude_ai)) => {
@@ -1014,7 +1015,9 @@ async fn handle_auth_command(args: &[String]) -> anyhow::Result<()> {
             eprintln!("Unknown auth subcommand: '{}'", unknown);
             eprintln!();
             eprintln!("Usage: claude auth <subcommand>");
-            eprintln!("  login [--console]   Authenticate (claude.ai by default; --console for API key)");
+            eprintln!(
+                "  login [--console]   Authenticate (claude.ai by default; --console for API key)"
+            );
             eprintln!("  logout              Remove stored credentials");
             eprintln!("  status [--json]     Show authentication status");
             std::process::exit(1);
@@ -1035,7 +1038,9 @@ async fn handle_auth_command(args: &[String]) -> anyhow::Result<()> {
 /// Print current auth status, then exit with code 0 (logged in) or 1 (not logged in).
 async fn auth_status(json_output: bool) {
     // Gather auth state
-    let env_api_key = std::env::var("ANTHROPIC_API_KEY").ok().filter(|k| !k.is_empty());
+    let env_api_key = std::env::var("ANTHROPIC_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty());
     let settings = Settings::load().await.unwrap_or_default();
     let settings_api_key = settings.config.api_key.clone().filter(|k| !k.is_empty());
     let oauth_tokens = cc_core::oauth::OAuthTokens::load().await;
@@ -1043,7 +1048,11 @@ async fn auth_status(json_output: bool) {
     // Determine auth method (mirrors TypeScript authStatus())
     let (auth_method, logged_in) = if let Some(ref tokens) = oauth_tokens {
         let uses_bearer = tokens.uses_bearer_auth();
-        let method = if uses_bearer { "claude.ai" } else { "oauth_token" };
+        let method = if uses_bearer {
+            "claude.ai"
+        } else {
+            "oauth_token"
+        };
         (method.to_string(), true)
     } else if env_api_key.is_some() {
         ("api_key".to_string(), true)

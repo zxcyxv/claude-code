@@ -20,13 +20,21 @@ static SUPPORTED_SETTINGS: &[(&str, &str)] = &[
     ("model", "LLM model to use (e.g. 'claude-opus-4-6')"),
     ("max_tokens", "Maximum output tokens per response"),
     ("verbose", "Enable verbose logging (true/false)"),
-    ("permission_mode", "Permission mode: default | accept_edits | bypass_permissions | plan"),
-    ("auto_compact", "Auto-compact conversation when context fills (true/false)"),
+    (
+        "permission_mode",
+        "Permission mode: default | accept_edits | bypass_permissions | plan",
+    ),
+    (
+        "auto_compact",
+        "Auto-compact conversation when context fills (true/false)",
+    ),
 ];
 
 #[async_trait]
 impl Tool for ConfigTool {
-    fn name(&self) -> &str { "Config" }
+    fn name(&self) -> &str {
+        "Config"
+    }
 
     fn description(&self) -> &str {
         "Get or set Claude Code configuration settings. Omit 'value' to read the current value. \
@@ -34,7 +42,9 @@ impl Tool for ConfigTool {
          Changes persist to ~/.claude/settings.json."
     }
 
-    fn permission_level(&self) -> PermissionLevel { PermissionLevel::Write }
+    fn permission_level(&self) -> PermissionLevel {
+        PermissionLevel::Write
+    }
 
     fn input_schema(&self) -> Value {
         json!({
@@ -45,6 +55,7 @@ impl Tool for ConfigTool {
                     "description": "Setting key (e.g. 'model', 'verbose', 'max_tokens', 'permission_mode')"
                 },
                 "value": {
+                    "type": ["string", "number", "integer", "boolean", "object", "array", "null"],
                     "description": "New value to set. Omit to read the current value."
                 }
             },
@@ -66,10 +77,7 @@ impl Tool for ConfigTool {
                 .iter()
                 .map(|(k, d)| format!("  {} — {}", k, d))
                 .collect();
-            return ToolResult::success(format!(
-                "Supported settings:\n{}",
-                lines.join("\n")
-            ));
+            return ToolResult::success(format!("Supported settings:\n{}", lines.join("\n")));
         }
 
         // Load current settings
@@ -95,7 +103,11 @@ impl Tool for ConfigTool {
                 "max_tokens" => {
                     let n = match new_value.as_u64() {
                         Some(n) => n as u32,
-                        None => return ToolResult::error("'max_tokens' must be a positive integer".to_string()),
+                        None => {
+                            return ToolResult::error(
+                                "'max_tokens' must be a positive integer".to_string(),
+                            )
+                        }
                     };
                     settings.config.max_tokens = Some(n);
                     if let Err(e) = settings.save().await {
@@ -106,7 +118,9 @@ impl Tool for ConfigTool {
                 "verbose" => {
                     let b = match new_value.as_bool() {
                         Some(b) => b,
-                        None => return ToolResult::error("'verbose' must be true or false".to_string()),
+                        None => {
+                            return ToolResult::error("'verbose' must be true or false".to_string())
+                        }
                     };
                     settings.config.verbose = b;
                     if let Err(e) = settings.save().await {
@@ -117,7 +131,11 @@ impl Tool for ConfigTool {
                 "auto_compact" => {
                     let b = match new_value.as_bool() {
                         Some(b) => b,
-                        None => return ToolResult::error("'auto_compact' must be true or false".to_string()),
+                        None => {
+                            return ToolResult::error(
+                                "'auto_compact' must be true or false".to_string(),
+                            )
+                        }
                     };
                     settings.config.auto_compact = b;
                     if let Err(e) = settings.save().await {
@@ -129,7 +147,11 @@ impl Tool for ConfigTool {
                     use cc_core::config::PermissionMode;
                     let s = match new_value.as_str() {
                         Some(s) => s,
-                        None => return ToolResult::error("'permission_mode' must be a string".to_string()),
+                        None => {
+                            return ToolResult::error(
+                                "'permission_mode' must be a string".to_string(),
+                            )
+                        }
                     };
                     let mode = match s {
                         "default" => PermissionMode::Default,
@@ -167,14 +189,10 @@ impl Tool for ConfigTool {
                     "max_tokens = {}",
                     settings.config.effective_max_tokens()
                 )),
-                "verbose" => ToolResult::success(format!(
-                    "verbose = {}",
-                    settings.config.verbose
-                )),
-                "auto_compact" => ToolResult::success(format!(
-                    "auto_compact = {}",
-                    settings.config.auto_compact
-                )),
+                "verbose" => ToolResult::success(format!("verbose = {}", settings.config.verbose)),
+                "auto_compact" => {
+                    ToolResult::success(format!("auto_compact = {}", settings.config.auto_compact))
+                }
                 "permission_mode" => ToolResult::success(format!(
                     "permission_mode = \"{}\"",
                     permission_mode_str(&settings.config.permission_mode)

@@ -4,15 +4,15 @@
 // All sub-modules are defined inline below.
 
 // Re-export commonly used types at the crate root
-pub use error::{ClaudeError, Result};
-pub use types::{
-    ContentBlock, ImageSource, DocumentSource, CitationsConfig, Message, MessageContent,
-    MessageCost, Role, ToolDefinition, ToolResultContent, UsageInfo,
-};
 pub use config::{Config, McpServerConfig, OutputFormat, PermissionMode, Settings, Theme};
 pub use cost::CostTracker;
+pub use error::{ClaudeError, Result};
 pub use history::ConversationSession;
 pub use permissions::{PermissionDecision, PermissionHandler, PermissionRequest};
+pub use types::{
+    CitationsConfig, ContentBlock, DocumentSource, ImageSource, Message, MessageContent,
+    MessageCost, Role, ToolDefinition, ToolResultContent, UsageInfo,
+};
 
 // ---------------------------------------------------------------------------
 // error module
@@ -500,6 +500,28 @@ pub mod config {
     }
 
     impl Config {
+        /// Return `true` when the configured API base points at a local server.
+        ///
+        /// This is used to support local Anthropic-compatible backends such as
+        /// `llama.cpp` without triggering OAuth flows or sending real Claude
+        /// credentials to a localhost process.
+        pub fn api_base_is_local(api_base: &str) -> bool {
+            let Ok(url) = url::Url::parse(api_base) else {
+                return false;
+            };
+
+            match url.host_str() {
+                Some("localhost") | Some("127.0.0.1") | Some("::1") => true,
+                _ => false,
+            }
+        }
+
+        /// Returns `true` when the effective API base is a local Anthropic-
+        /// compatible backend such as `http://localhost:8080`.
+        pub fn use_local_backend(&self) -> bool {
+            Self::api_base_is_local(&self.resolve_api_base())
+        }
+
         /// Resolve the effective model, falling back to the compile-time default.
         pub fn effective_model(&self) -> &str {
             self.model
@@ -547,6 +569,11 @@ pub mod config {
             if let Some(key) = self.resolve_api_key() {
                 return Some((key, false));
             }
+            // Local Anthropic-compatible backends should never receive saved
+            // Claude OAuth credentials. Use a harmless placeholder instead.
+            if self.use_local_backend() {
+                return Some(("local".to_string(), false));
+            }
             // Fall back to saved OAuth tokens
             let tokens = crate::oauth::OAuthTokens::load().await?;
 
@@ -565,25 +592,43 @@ pub mod config {
                     let refreshed = 'refresh: {
                         let Ok(client) = reqwest::Client::builder()
                             .timeout(std::time::Duration::from_secs(30))
-                            .build() else { break 'refresh None; };
+                            .build()
+                        else {
+                            break 'refresh None;
+                        };
                         let Ok(resp) = client
                             .post(crate::oauth::TOKEN_URL)
                             .header("content-type", "application/json")
                             .json(&body)
                             .send()
-                            .await else { break 'refresh None; };
-                        if !resp.status().is_success() { break 'refresh None; }
-                        let Ok(data) = resp.json::<serde_json::Value>().await else { break 'refresh None; };
+                            .await
+                        else {
+                            break 'refresh None;
+                        };
+                        if !resp.status().is_success() {
+                            break 'refresh None;
+                        }
+                        let Ok(data) = resp.json::<serde_json::Value>().await else {
+                            break 'refresh None;
+                        };
                         let new_at = data["access_token"].as_str().unwrap_or("").to_string();
-                        if new_at.is_empty() { break 'refresh None; }
+                        if new_at.is_empty() {
+                            break 'refresh None;
+                        }
                         let new_rt = data["refresh_token"].as_str().map(String::from);
                         let exp_in = data["expires_in"].as_u64().unwrap_or(3600);
                         let exp_ms = chrono::Utc::now().timestamp_millis() + (exp_in as i64 * 1000);
                         let scopes: Vec<String> = data["scope"]
-                            .as_str().unwrap_or("").split_whitespace().map(String::from).collect();
+                            .as_str()
+                            .unwrap_or("")
+                            .split_whitespace()
+                            .map(String::from)
+                            .collect();
                         let mut r = tokens.clone();
                         r.access_token = new_at;
-                        if let Some(nrt) = new_rt { r.refresh_token = Some(nrt); }
+                        if let Some(nrt) = new_rt {
+                            r.refresh_token = Some(nrt);
+                        }
                         r.expires_at_ms = Some(exp_ms);
                         r.scopes = scopes;
                         let _ = r.save().await;
@@ -771,10 +816,7 @@ pub mod context {
 
             // Platform information
             parts.push(format!("Platform: {}", std::env::consts::OS));
-            parts.push(format!(
-                "Working directory: {}",
-                self.cwd.display()
-            ));
+            parts.push(format!("Working directory: {}", self.cwd.display()));
 
             if let Some(git_context) = self.get_git_context().await {
                 parts.push(git_context);
@@ -787,9 +829,7 @@ pub mod context {
         pub async fn build_user_context(&self) -> String {
             let mut parts = vec![];
 
-            let date = chrono::Local::now()
-                .format("%A, %B %d, %Y")
-                .to_string();
+            let date = chrono::Local::now().format("%A, %B %d, %Y").to_string();
             parts.push(format!("Today's date is {}.", date));
 
             if !self.disable_claude_mds {
@@ -839,8 +879,9 @@ pub mod context {
 
             // Global ~/.claude/CLAUDE.md
             if let Some(home) = dirs::home_dir() {
-                let global_claude_md =
-                    home.join(".claude").join(crate::constants::CLAUDE_MD_FILENAME);
+                let global_claude_md = home
+                    .join(".claude")
+                    .join(crate::constants::CLAUDE_MD_FILENAME);
                 if global_claude_md.exists() {
                     if let Ok(content) = tokio::fs::read_to_string(&global_claude_md).await {
                         claude_mds.push(format!(
@@ -1062,9 +1103,7 @@ pub mod history {
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) == Some("json") {
                 if let Ok(content) = tokio::fs::read_to_string(&path).await {
-                    if let Ok(session) =
-                        serde_json::from_str::<ConversationSession>(&content)
-                    {
+                    if let Ok(session) = serde_json::from_str::<ConversationSession>(&content) {
                         sessions.push(session);
                     }
                 }
@@ -1182,13 +1221,7 @@ pub mod cost {
             *self.pricing.write() = ModelPricing::for_model(model);
         }
 
-        pub fn add_usage(
-            &self,
-            input: u64,
-            output: u64,
-            cache_creation: u64,
-            cache_read: u64,
-        ) {
+        pub fn add_usage(&self, input: u64, output: u64, cache_creation: u64, cache_read: u64) {
             self.input_tokens.fetch_add(input, Ordering::Relaxed);
             self.output_tokens.fetch_add(output, Ordering::Relaxed);
             self.cache_creation_tokens
@@ -1390,10 +1423,8 @@ pub mod oauth {
     pub const CONSOLE_AUTHORIZE_URL: &str = "https://platform.claude.com/oauth/authorize";
     pub const CLAUDE_AI_AUTHORIZE_URL: &str = "https://claude.com/cai/oauth/authorize";
     pub const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
-    pub const API_KEY_URL: &str =
-        "https://api.anthropic.com/api/oauth/claude_cli/create_api_key";
-    pub const MANUAL_REDIRECT_URL: &str =
-        "https://platform.claude.com/oauth/code/callback";
+    pub const API_KEY_URL: &str = "https://api.anthropic.com/api/oauth/claude_cli/create_api_key";
+    pub const MANUAL_REDIRECT_URL: &str = "https://platform.claude.com/oauth/code/callback";
     pub const CLAUDEAI_SUCCESS_URL: &str =
         "https://platform.claude.com/oauth/code/success?app=claude-code";
     pub const CONSOLE_SUCCESS_URL: &str = "https://platform.claude.com/buy_credits\
@@ -1449,7 +1480,11 @@ pub mod oauth {
         /// - Claude.ai flow: the `access_token` itself (Bearer)
         pub fn effective_credential(&self) -> Option<&str> {
             if self.uses_bearer_auth() {
-                if self.access_token.is_empty() { None } else { Some(&self.access_token) }
+                if self.access_token.is_empty() {
+                    None
+                } else {
+                    Some(&self.access_token)
+                }
             } else {
                 self.api_key.as_deref()
             }
@@ -1539,8 +1574,7 @@ pub mod oauth {
         callback_port: u16,
         is_manual: bool,
     ) -> String {
-        let mut u = url::Url::parse(authorize_base)
-            .expect("valid OAuth authorize base URL");
+        let mut u = url::Url::parse(authorize_base).expect("valid OAuth authorize base URL");
         {
             let mut q = u.query_pairs_mut();
             q.append_pair("code", "true");
@@ -1568,16 +1602,16 @@ pub use oauth::OAuthTokens;
 // New modules: keybindings, voice, analytics, lsp, team_memory_sync,
 //              system_prompt, memdir, oauth_config
 // ---------------------------------------------------------------------------
-pub mod keybindings;
-pub mod voice;
 pub mod analytics;
+pub mod keybindings;
 pub mod lsp;
-pub mod team_memory_sync;
-pub mod system_prompt;
 pub mod memdir;
-pub mod oauth_config;
 pub mod migrations;
+pub mod oauth_config;
 pub mod output_styles;
+pub mod system_prompt;
+pub mod team_memory_sync;
+pub mod voice;
 
 #[cfg(test)]
 mod tests {
@@ -1649,7 +1683,10 @@ mod tests {
     #[test]
     fn test_config_effective_max_tokens_default() {
         let cfg = crate::config::Config::default();
-        assert_eq!(cfg.effective_max_tokens(), crate::constants::DEFAULT_MAX_TOKENS);
+        assert_eq!(
+            cfg.effective_max_tokens(),
+            crate::constants::DEFAULT_MAX_TOKENS
+        );
     }
 
     #[test]
@@ -1714,7 +1751,10 @@ mod tests {
             expires_at_ms: None,
             ..Default::default()
         };
-        assert!(!tokens.is_expired(), "Token with no expiry should not be considered expired");
+        assert!(
+            !tokens.is_expired(),
+            "Token with no expiry should not be considered expired"
+        );
     }
 
     #[test]
@@ -1747,7 +1787,10 @@ mod tests {
             expires_at_ms: Some(chrono::Utc::now().timestamp_millis() + 3 * 60 * 1000),
             ..Default::default()
         };
-        assert!(tokens.is_expired(), "Token within 5-min buffer should be considered expired");
+        assert!(
+            tokens.is_expired(),
+            "Token within 5-min buffer should be considered expired"
+        );
     }
 
     #[test]
@@ -1817,9 +1860,15 @@ mod tests {
     fn test_pkce_code_verifier_length() {
         let verifier = crate::oauth::generate_code_verifier();
         // 32 bytes base64url-encoded (no padding) = ceil(32 * 4/3) = 43 chars
-        assert_eq!(verifier.len(), 43, "Code verifier should be 43 base64url chars (32 bytes)");
+        assert_eq!(
+            verifier.len(),
+            43,
+            "Code verifier should be 43 base64url chars (32 bytes)"
+        );
         // Must only contain URL-safe base64 chars
-        assert!(verifier.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        assert!(verifier
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
     }
 
     #[test]
@@ -1827,8 +1876,14 @@ mod tests {
         let verifier = crate::oauth::generate_code_verifier();
         let challenge = crate::oauth::generate_code_challenge(&verifier);
         // SHA256 = 32 bytes → 43 base64url chars
-        assert_eq!(challenge.len(), 43, "Code challenge should be 43 base64url chars (SHA256 = 32 bytes)");
-        assert!(challenge.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        assert_eq!(
+            challenge.len(),
+            43,
+            "Code challenge should be 43 base64url chars (SHA256 = 32 bytes)"
+        );
+        assert!(challenge
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
     }
 
     #[test]
@@ -1851,7 +1906,9 @@ mod tests {
     fn test_pkce_state_length_and_format() {
         let state = crate::oauth::generate_state();
         assert_eq!(state.len(), 43);
-        assert!(state.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        assert!(state
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
     }
 
     // ---- Auth URL building tests --------------------------------------------
@@ -1888,10 +1945,7 @@ mod tests {
             9999,
             true, // manual
         );
-        assert!(
-            url.contains("redirect_uri="),
-            "URL must have redirect_uri"
-        );
+        assert!(url.contains("redirect_uri="), "URL must have redirect_uri");
         // Manual redirect should NOT be localhost
         assert!(
             !url.contains("localhost"),
@@ -2002,8 +2056,12 @@ mod tests {
     #[test]
     fn test_message_get_all_text_multiple_blocks() {
         let msg = Message::assistant_blocks(vec![
-            ContentBlock::Text { text: "First ".into() },
-            ContentBlock::Text { text: "Second".into() },
+            ContentBlock::Text {
+                text: "First ".into(),
+            },
+            ContentBlock::Text {
+                text: "Second".into(),
+            },
         ]);
         assert_eq!(msg.get_all_text(), "First Second");
     }
@@ -2015,7 +2073,9 @@ mod tests {
                 thinking: "reasoning".into(),
                 signature: "sig".into(),
             },
-            ContentBlock::Text { text: "answer".into() },
+            ContentBlock::Text {
+                text: "answer".into(),
+            },
         ]);
         assert_eq!(msg.get_text(), Some("answer"));
     }
