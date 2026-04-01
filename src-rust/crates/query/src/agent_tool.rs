@@ -157,6 +157,8 @@ impl Tool for AgentTool {
             max_turns: params.max_turns.unwrap_or(10),
             system_prompt: Some(system_prompt),
             append_system_prompt: None,
+            output_style: cc_core::system_prompt::OutputStyle::Default,
+            working_directory: None,
             thinking_budget: None,
             temperature: None,
         };
@@ -187,19 +189,14 @@ impl Tool for AgentTool {
                 );
                 ToolResult::success(text)
             }
-            QueryOutcome::MaxTokens { partial_message, .. } => {
+            QueryOutcome::MaxTokens {
+                partial_message, ..
+            } => {
                 let text = partial_message.get_all_text();
-                ToolResult::success(format!(
-                    "{}\n\n[Note: Agent hit max_tokens limit]",
-                    text
-                ))
+                ToolResult::success(format!("{}\n\n[Note: Agent hit max_tokens limit]", text))
             }
-            QueryOutcome::Cancelled => {
-                ToolResult::error("Sub-agent was cancelled".to_string())
-            }
-            QueryOutcome::Error(e) => {
-                ToolResult::error(format!("Sub-agent error: {}", e))
-            }
+            QueryOutcome::Cancelled => ToolResult::error("Sub-agent was cancelled".to_string()),
+            QueryOutcome::Error(e) => ToolResult::error(format!("Sub-agent error: {}", e)),
         }
     }
 }
